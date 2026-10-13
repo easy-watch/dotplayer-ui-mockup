@@ -2,9 +2,9 @@
 
 Project: MusicPlayer
 Document: MUSIC_UTILITIES_SPEC.md
-Version: 3 (revised after implementation review)
-Status: Proposed: Feature Expansion
-Purpose: Define functional, architectural, UI, system-integration, and testing requirements for everyday music utilities without destabilizing the Release Candidate baseline.
+Version: 5
+Status: Proposed: Feature Expansion (not yet implemented)
+Purpose: Define the functional, architectural, UI, system-integration and testing requirements for everyday music utilities without destabilizing the Release Candidate baseline.
 
 Related docs:
 - PRODUCT_SPEC.md
@@ -16,98 +16,92 @@ Related docs:
 - PLAYBACK_ARCHITECTURE.md
 - TEST_PLAN.md
 
-> Revision note (v3):
-> This revision incorporates:
-> - explicit handling for WRITE_SETTINGS and pending-action re-entry after Settings
-> - exact API-level behavior for copying vs direct URI for system sounds
-> - registry tracking for created ringtone/notification/alarm copies
-> - clearer failure/success read-back verification
-> - better null/unsupported handling for DRM and unreadable files
-> - explicit notification-channel limits under Android O+
-> - stronger sorting guidance with locale-aware collation and deterministic tie-breakers
-> - a single action framework for all track utilities
-> - improved P0/P1 ordering and milestone structure
+> Revision note (v5).
+> Revised before implementation. Compared with v4, this version:
+> - adds a pending system-sound action TTL and a single-pending-action rule
+> - requires the pending action to be stored before leaving for Settings and persisted in saved state with a createdAt timestamp
+> - requires re-checking permission on resume instead of trusting the activity result
+> - adds a read-back algorithm based on MediaStore id resolution, with Success / Failed / Unverified outcomes
+> - clarifies that copy and inspector operations have explicit timeouts
+> - names the required constants for share cap, copy timeout, inspector timeout, and pending TTL
+> - clarifies backup exclusion for system-sound copies and the performance safety of the copy registry
+> - adds work-profile / multi-user handling and an OEM caveat test requirement
+> - adds the missing "only one pending action at a time" rule
+> - strengthens the "may not affect everything" caveat for ringtone, notification and alarm sounds
+> - removes ambiguity around track list ordering and playlist item id selection
+> - adds exact QA reporting language for previously unverified items
+>
+> Section 47 contains the full change list.
 
 ---
 
 ## 1. Scope
 
 This document covers:
-- sorting (tracks, albums, artists, folders, playlists, search)
-- track action framework and menu
-- share (single and batch)
-- set as ringtone / notification sound / alarm sound
-- song details
-- show in files (best effort)
-- multi-select and batch actions
-- entity navigation shortcuts
-- Android system integration, error handling, persistence, accessibility, and testing
 
-This specification is implementation-focused. It does not describe only mockups.
+- Sorting (tracks, albums, artists, folders, playlists, search)
+- Track action framework and menu
+- Share (single and batch)
+- Set as ringtone / notification sound / alarm sound
+- Song Details
+- Show in Files (best effort)
+- Multi-select and batch actions
+- Entity navigation shortcuts
+- Android system integration, error handling, persistence, accessibility and testing
+
+It is an implementation specification, not a design-only concept.
 
 ---
 
 ## 2. Protected Baseline
 
-The current Release Candidate is the protected baseline. New features must not unnecessarily modify or replace:
-- Media3 ExoPlayer architecture and service ownership
-- MediaSession / MediaLibraryService / MediaController communication
-- PlaybackController design and authoritative player ownership
-- audio focus handling and audio-becoming-noisy behavior
-- background playback, queue synchronization, shuffle, repeat, and resumption
-- MediaStore scanning and ContentObserver architecture
-- Room and DataStore architecture
-- library navigation, Now Playing behavior, widgets, and visualizer
-- the privacy model, except for the single documented addition in section 4
+The current Release Candidate is the protected baseline. New features MUST NOT unnecessarily modify or replace:
 
-New utilities must communicate through existing domain/repository abstractions. They must never create a second ExoPlayer or a second authoritative playback instance.
+- Media3 ExoPlayer architecture and service ownership (`MusicPlaybackService` owns the only authoritative player)
+- MediaSession / `MediaLibraryService`, `MediaController` communication, `PlaybackController`
+- Audio focus and audio-becoming-noisy handling
+- Background playback, queue synchronization, shuffle, repeat, playback resumption
+- MediaStore scanning and `ContentObserver`
+- Room and DataStore architecture (additions allowed only as stated in this document)
+- Library navigation, Now Playing behavior, widgets, visualizer
+- The privacy model, except for the single documented addition in section 4
+
+New utilities use existing domain/repository abstractions. They never create a second `ExoPlayer`.
 
 ---
 
 ## 3. Product Philosophy
 
-MusicPlayer is a fast, private, offline-first local music player with excellent Android system integration. Utilities must remain:
-- offline-first
-- fast
-- minimal
-- predictable
-- privacy-preserving
-- visually consistent with the existing design system
-
-No accounts, online services, analytics, or network dependencies are allowed.
+MusicPlayer is a fast, private, offline-first local music player with excellent Android system integration. Utilities must remain offline-first, fast, minimal, predictable, privacy-preserving and visually consistent with the existing design system. No accounts, online services, analytics or network dependencies.
 
 ---
 
 ## 4. Permissions and Privacy Impact
 
-This expansion adds one special-access permission. It must be documented in PRODUCT_SPEC.md and the privacy/About screen.
+This expansion adds one special-access permission. It must be documented in `PRODUCT_SPEC.md` and in the privacy/About screen.
 
 | Permission | Needed for | Type | When requested |
 |---|---|---|---|
-| READ_MEDIA_AUDIO (existing) | library | runtime | existing flow |
-| POST_NOTIFICATIONS (existing) | playback notification | runtime | existing flow |
-| WRITE_SETTINGS (new) | set default ringtone, notification sound, or alarm sound | special app access: Modify system settings | only when the user first chooses a Set as... action |
+| `READ_MEDIA_AUDIO` (existing) | Library | Runtime | Existing flow |
+| `POST_NOTIFICATIONS` (existing) | Playback notification | Runtime | Existing flow |
+| `WRITE_SETTINGS` (new) | Setting the default ringtone, notification or alarm sound | Special app access ("Modify system settings") | Only when the user first chooses a Set as... action |
 
 Rules:
+
 - Declare:
-  <uses-permission android:name="android.permission.WRITE_SETTINGS" />
-- Check Settings.System.canWrite(context) before every system-sound operation.
-- If permission is not granted:
-  - show an explanation
-  - launch Settings.ACTION_MANAGE_WRITE_SETTINGS with the app package URI
-  - re-check permission on return
-  - continue only if granted
-- If user declines:
-  - feature stays unavailable with a clear message
-  - nothing else in the app is affected
+  `android.permission.WRITE_SETTINGS`
+- Check `Settings.System.canWrite(context)` before every system-sound operation.
+- If not granted, explain the reason, then launch `Settings.ACTION_MANAGE_WRITE_SETTINGS` with the URI `package:<applicationId>`.
+- `ACTION_MANAGE_WRITE_SETTINGS` does not return a reliable result code. Never infer the outcome from the result; re-check `canWrite()` when the screen resumes.
+- If the user does not grant it, the Set as... actions stay unavailable with a clear message. Nothing else in the app is affected.
 - Still forbidden:
-  - INTERNET
-  - RECORD_AUDIO
+  - `INTERNET`
+  - `RECORD_AUDIO`
   - location
   - contacts
   - camera
   - broad storage permissions
-- On API 29+ no additional storage permission is needed for MediaStore-managed copies.
+- API 29+ requires no extra storage permission for entries the app creates itself.
 
 ---
 
@@ -127,7 +121,7 @@ Rules:
 |  | 10. Entity navigation shortcuts |
 | P2 | 11. Show in Files (best effort) |
 
-Song Details is placed ahead of ringtone work because it has no special permission and is the lowest-risk P0 utility. All P0 features ship before P1.
+Song Details precedes the ringtone work: it needs no special permission and is the lowest-risk P0. All P0 features ship before P1.
 
 ---
 # Part A: Sorting
@@ -145,20 +139,18 @@ Each entity has its own key set. Keys that do not make sense for an entity are n
 | Playlists | Name, Date Created, Track Count | Name, ascending |
 | Search results | Relevance (default), then Title / Artist | Relevance |
 
-All entities support Ascending and Descending. The UI must clearly show the selected key and direction.
+All entities support ascending and descending. The UI clearly shows the selected key and direction.
 
 Example:
-- Sort Tracks
-  - Title
-  - Artist
-  - Album
-  - Duration
-  - Date Added
-  - Year
-  - File Size
-- Order:
-  - Ascending
-  - Descending
+
+```text
+SORT TRACKS
+ ● Title   ○ Artist   ○ Album   ○ Duration
+ ○ Date Added   ○ Year   ○ File Size
+
+ORDER
+ ● Ascending   ○ Descending
+```
 
 Inside detail screens:
 - Album detail stays in disc/track-number order
@@ -167,55 +159,51 @@ Inside detail screens:
 
 ## 7. Defaults and Upgrade Safety
 
-- Default sort is Title ascending, unless the app already defines a different ordering.
-- Existing DataStore key sort_order is migrated into trackSortKey / trackSortDirection on first launch of the new version, so user library order is not silently reordered.
-- Migration must be idempotent and covered by a test.
+- Default is Title ascending, unless the app already defines a different ordering.
+- The existing DataStore key `sort_order` is migrated into `trackSortKey` / `trackSortDirection` on first launch of the new version, so no user's library is silently reordered.
+- The migration is idempotent and covered by a test.
 
 ## 8. Persistence
 
-Persist sort state in DataStore, not Room:
-- trackSortKey
-- trackSortDirection
-- albumSortKey
-- albumSortDirection
-- artistSortKey
-- artistSortDirection
-- folderSortKey
-- folderSortDirection
-- playlistSortKey
-- playlistSortDirection
+Persist sort state in DataStore (not Room):
 
-Search sort is not persisted; it resets to Relevance for each search session.
+```text
+trackSortKey,    trackSortDirection
+albumSortKey,    albumSortDirection
+artistSortKey,   artistSortDirection
+folderSortKey,   folderSortDirection
+playlistSortKey, playlistSortDirection
+```
+
+Search sort is not persisted; it resets to Relevance each search session.
 
 ## 9. Sorting Requirements
 
-Sorting must be deterministic, stable, null-safe, efficient, and consistent across refreshes.
+Sorting must be deterministic, stable, null-safe, efficient and consistent across refreshes.
 
 - Locale-aware collation:
-  - Use java.text.Collator or ICU Collator for the user's locale
-  - Do not use naive lowercase() for ordering
-  - Cache the Collator instance
-  - Precompute collation keys when sorting large lists
-  - This is required for non-Latin titles (for example Bangla, Arabic, accented Latin titles)
+  - Use a `Collator` for the user's locale.
+  - Do not use naive `lowercase()` for ordering.
+  - Prefer `android.icu.text.Collator` (API 24+) with numeric collation enabled so `"Track 2"` sorts before `"Track 10"`.
+  - Cache the collator and precompute collation keys for large lists.
+  - Required for non-Latin titles and for accented Latin titles.
+- Locale change:
+  - When the system locale changes, rebuild the collator and invalidate cached sort results.
 - Unknown values:
-  - missing artist/album/year are treated as "unknown" and placed last in both ascending and descending order
-  - do not fabricate metadata to overcome nulls
+  - Missing artist/album/year are "unknown" and placed last in both ascending and descending order.
+  - Never fabricate metadata.
 - Tie-breaker:
-  - after primary key, sort by title (collated), then by id
-  - this ensures stable order across refreshes
+  - After the primary key, order by collated title, then by `id` to ensure stable order across refreshes.
 - Numeric keys:
-  - duration, size, date added, year use numeric comparison
+  - Duration, size, date added and year compare numerically.
 - Queue independence:
-  - changing sort must not reorder or mutate the active playback queue
-  - only a new “Play all / Shuffle” action started from the visible list uses displayed order
+  - Changing a sort must not reorder or modify the active playback queue.
+  - Only a new "Play all / Shuffle" started from the visible list uses the displayed order.
 - Performance:
-  - sorting runs off the main thread
-  - sorted lists are exposed as observable state
-  - re-sort only when the snapshot or sort preference changes
-  - do not sort inside a Composable or on recomposition
-- Collator cache invalidation:
-  - if the locale changes, rebuild the collator and sort cache
-  - a locale change should invalidate in-memory sort results
+  - Sort off the main thread.
+  - Expose results as observable state.
+  - Re-sort only when the library snapshot, sort preference or locale changes.
+  - Never sort inside a `Composable` or on recomposition.
 
 ---
 # Part B: Track Action Framework
@@ -244,87 +232,67 @@ sealed interface TrackAction {
 enum class SystemSoundType { RINGTONE, NOTIFICATION, ALARM }
 ```
 
-A single TrackActionHandler (injected into ViewModels) maps actions to existing use cases:
+A single `TrackActionHandler` (injected into ViewModels) maps actions to existing use cases:
 
 | Action | Delegates to |
 |---|---|
-| Play / Play Next / Add to Queue | existing PlaybackController queue API |
-| Favorite | existing favorites repository |
-| Add to Playlist | existing playlist selection UI and repository |
-| Share | ShareTracksUseCase |
-| Set system sound | SetSystemSoundUseCase |
-| Details | GetTrackDetailsUseCase |
-| Go to ... | existing navigation routes |
+| Play / Play Next / Add to Queue | Existing `PlaybackController` queue API |
+| Favorite | Existing favorites repository |
+| Add to Playlist | Existing playlist-selection UI and repository |
+| Share | `ShareTracksUseCase` |
+| Set system sound | `SetSystemSoundUseCase` |
+| Details | `GetTrackDetailsUseCase` |
+| Go to ... | Existing navigation routes |
 
-No duplicate playback, queue, favorite, or playlist logic is permitted.
+No duplicate playback, queue, favorite or playlist logic is permitted.
 
 ## 11. Menu Content and Context Rules
 
 Standard menu order:
-1. Play
-2. Play Next
-3. Add to Queue
-4. divider
-5. Add to Favorites / Remove from Favorites
-6. Add to Playlist
-7. divider
-8. Share
-9. Set as Ringtone
-10. Set as Notification Sound
-11. Set as Alarm Sound
-12. divider
-13. Song Details
-14. Show in Files
-15. divider
-16. Go to Artist
-17. Go to Album
-18. Go to Folder
 
-Availability depends on context via a pure function:
-- availableActions(track, context)
+```text
+Play
+Play Next
+Add to Queue
+-----
+Add to Favorites / Remove from Favorites
+Add to Playlist
+-----
+Share
+Set as Ringtone
+Set as Notification Sound
+Set as Alarm Sound
+-----
+Song Details
+Show in Files
+-----
+Go to Artist
+Go to Album
+Go to Folder
+```
 
-Rules:
-- If already on the album/artist/folder screen, hide the matching “Go to ...”
-- Playlist screen adds Remove from Playlist
-- Unavailable track:
-  - disable Play, Share, Set as..., Details, Show in Files
-  - allow Remove from Playlist and Remove Favorite
-- Favorite state:
-  - show Add or Remove according to actual state
-- Show in Files:
-  - hide or disable on unsupported devices / APIs
-- System-sound actions:
-  - disable on unreadable or missing track
-  - provide reason in confirmation sheet or toast
+Availability comes from one pure function, `availableActions(track, context)`:
+
+| Rule | Behavior |
+|---|---|
+| Already on that album/artist/folder screen | Hide the matching "Go to ..." |
+| Playlist screen | Add Remove from Playlist (removes the entry only, never the audio file) |
+| Track unavailable or file missing | Disable Play, Share, Set as..., Details, Show in Files; still allow Remove from Playlist and Remove from Favorites |
+| DRM-protected or unreadable file | Disable Share and all Set as... actions with a reason shown |
+| Favorite state | Show Add or Remove according to actual state |
+| Show in Files unsupported | Hide or disable |
 
 ## 12. Entry Points
 
-Use the same TrackAction set in:
-- long press menus
-- overflow menus
-- Search result menus
-- Playlist / Folder / Album track menus
-- mini-player and Now Playing menu
-- selection mode context bar
-
-All entry points must share one action framework.
+The same `TrackAction` set and `availableActions` are used by: long-press menus, overflow menu buttons, Search results, Playlist/Folder/Album track menus, Now Playing compact menu, and the selection-mode action bar. There is one framework, never one per screen.
 
 ## 13. Play, Play Next, Add to Queue, Favorites, Playlists
 
-- Play:
-  - uses existing playback abstraction
-  - never creates a separate player
-- Play Next:
-  - inserts directly after current item using existing queue API
-  - preserves queue semantics including shuffle/repeat
-- Add to Queue:
-  - appends using queue API
-- Favorites:
-  - existing repository remains authoritative
-- Add to Playlist:
-  - opens existing selection UI
-  - includes “+ New Playlist”
-  - reuses existing playlist repository
+- Play: uses the existing playback abstraction; never creates a separate player.
+- Play Next: inserts after the current item through the existing queue API; preserves shuffle/repeat and queue semantics.
+- Add to Queue: appends through the existing queue API.
+- Favorites: the existing repository stays authoritative.
+- Add to Playlist: opens the existing selection UI (including "+ New Playlist") and uses the existing playlist repository.
 
 ---
 # Part C: Share
@@ -334,488 +302,500 @@ All entry points must share one action framework.
 Share sends the actual audio file through the system Sharesheet.
 
 Rules:
-- Use each track’s MediaStore content URI
-- Do not expose app-private paths
-- Use Intent.ACTION_SEND or ACTION_SEND_MULTIPLE
-- Use EXTRA_STREAM with a valid URI
-- Add ClipData to the intent when needed
-- Set FLAG_GRANT_READ_URI_PERMISSION
-- Use correct MIME type from MediaStore MIME_TYPE if possible
-- fallback order:
-  1. MediaStore MIME_TYPE
-  2. MimeTypeMap from extension
-  3. audio/*
-- Never hardcode audio/mpeg for everything
-- Do not log file paths or raw content URIs beyond sanitized debug logs
+- Use the track's MediaStore `content://` URI. A separate `FileProvider` is not required for MediaStore URIs.
+- Build the intent with `Intent.ACTION_SEND`, `EXTRA_STREAM`, the MIME type, and always set:
+  - `ClipData` containing the URI
+  - `FLAG_GRANT_READ_URI_PERMISSION`
+- Wrap with `Intent.createChooser()`.
+- Never expose raw file paths, app-private paths or database paths.
+- MIME fallback order:
+  1. MediaStore `MIME_TYPE`
+  2. `MimeTypeMap` by file extension
+  3. `audio/*`
+- Never hardcode `audio/mpeg` for everything.
+- Do not log raw content URIs beyond sanitized debug output.
 
 ## 15. Batch Share
 
-- use ACTION_SEND_MULTIPLE
-- `EXTRA_STREAM` is an ArrayList<Uri>
-- `ClipData` contains all URIs
-- MIME type:
-  - if all selected items share a MIME type, use it
-  - otherwise use audio/*
-- cap:
-  - max 100 tracks per share
-  - constant: SHARE_MAX_ITEMS = 100
-- if user selects more than the cap:
-  - show message: “Select up to 100 tracks to share at once.”
-- skip unavailable tracks and report how many were skipped
-- if no shareable items survive:
-  - show “No valid files could be shared.”
+- Use `Intent.ACTION_SEND_MULTIPLE` with `EXTRA_STREAM` as an `ArrayList<Uri>`.
+- Include `ClipData` containing all URIs and the read-grant flag.
+- MIME:
+  - if all selected tracks share one MIME type, use it
+  - otherwise `audio/*`
+- Cap: `SHARE_MAX_ITEMS = 100`.
+- If the user selects more: "Select up to 100 tracks to share at once."
+- Skip unavailable, DRM-protected and unreadable tracks and report how many were skipped.
+- If no shareable items survive: "No valid files could be shared."
 
 ## 16. Failure Handling
 
 | Condition | Message |
 |---|---|
-| File not accessible | “Unable to share this track. The original audio file could not be accessed.” |
-| No app can handle the intent | “No app is available to share this file.” |
-| Failed batch share | “Shared N tracks. M could not be accessed.” |
-| Unsupported share target | “This file format cannot be shared from this device.” |
+| File not accessible | "Unable to share this track. The original audio file could not be accessed." |
+| No app can handle the intent | "No app is available to share this file." |
+| Batch with skipped items | "Shared N tracks. M could not be accessed." |
 
-No crash on any failure. Log sanitized cause only.
+No crash on any failure. Log a sanitized cause only.
 
 ---
 # Part D: System Sounds (Ringtone, Notification, Alarm)
 
 ## 17. One Mechanism, Three Types
 
-Ringtone, notification sound, and alarm sound all use the same API family:
-- RingtoneManager.setActualDefaultRingtoneUri(..., TYPE_RINGTONE)
-- TYPE_NOTIFICATION
-- TYPE_ALARM
+Ringtone, notification sound and alarm sound use the same API family:
+- `RingtoneManager.setActualDefaultRingtoneUri(..., TYPE_RINGTONE)`
+- `TYPE_NOTIFICATION`
+- `TYPE_ALARM`
 
-They all require WRITE_SETTINGS. They are implemented in SystemSoundManager and shipped together.
+All require `WRITE_SETTINGS`. They live in `SystemSoundManager`. Ringtone ships first (P0), notification and alarm reuse the same code (P1).
 
-What it changes:
-- the device’s default sound for that category
-- not a per-app channel override
-- not a per-contact ringtone override
-- not a per-alarm override inside third-party alarm apps
+What this changes:
+- the device's default sound for that category
 
-Important device caveat:
-- on Android O+ many apps use their own notification-channel sound and ignore the user’s default notification tone
-- the app must not claim that all notifications will change when the system default notification sound is updated
+What it does not change:
+- apps that set their own notification-channel sound (common on Android 8.0+)
+- clock/alarm apps that keep a per-alarm sound
+- per-contact ringtones
+- per-SIM ringtone settings on dual-SIM or OEM-customized devices
 
-## 18. Strategy: Copy vs Direct URI
+Therefore, every success message must be worded as a default change, and the confirmation sheet should include a one-line caveat.
 
-| API level | Strategy |
-|---|---|
-| 29+ | Copy track to the appropriate system collection and set the copied entry as the default |
-| 26-28 | Use original MediaStore URI directly when possible, because legacy storage permission is not requested |
-| lower than 26 | Not supported by the project baseline |
+Whole-track playback:
+- The entire selected track plays from the beginning; there is no trimmer or start-point picker.
+- This is a non-goal. It should be stated in the confirmation sheet.
 
-### API 29+ copy policy
-When changing a ringtone/notification/alarm:
-- copy the track into:
-  - Ringtones/
-  - Notifications/
-  - Alarms/
-- use MediaStore audio collection with proper flags
-- set the copied entry as the default
-- do not require broad storage permission
-- do not deny a feature because the user has no writable folder; use standard system collections
+## 18. Permission Flow and Pending Action
 
-### Why copy on 29+
-This keeps the setting stable if the original file moves or is deleted and matches Android system expectations for ringtone collections.
+The pending action must be stored before leaving for Settings, and must survive process death.
 
-## 19. Copy Reuse and Registry
+Required constants:
 
-The app must keep track of copies it created so it can:
-- avoid duplicates
-- detect preexisting copy from the same source
-- delete created copies later if a cleanup feature is added
+```kotlin
+const val PENDING_SYSTEM_SOUND_TTL_MS = 10 * 60_000L
+const val COPY_TIMEOUT_MS = 30_000L
+const val INSPECTOR_TIMEOUT_MS = 5_000L
+const val SHARE_MAX_ITEMS = 100
+```
 
-Recommended registry:
-- a small app-managed registry in Room or DataStore to track:
-  - sourceTrackId
-  - sourceUri
-  - copiedUri
-  - copiedType (RINGTONE / NOTIFICATION / ALARM)
-  - systemCollectionPath
-  - createdAt
-  - sizeBytes
-- if the same source track is set again:
-  - reuse the existing copiedUri if it still exists
-  - else create a new copy
-- matching rules:
-  1. exact sourceTrackId match is preferred
-  2. fallback: same file name + size + same collection path + same app owner
-  3. choose only a single unambiguous result
+Required state model:
 
-This should be in a dedicated table or small datastore index, not ad hoc in memory only.
+```kotlin
+data class PendingSystemSound(
+    val trackId: Long,
+    val type: SystemSoundType,
+    val createdAtMs: Long
+)
+```
 
-## 20. Permission Flow and Pending Action Pattern
+Rules:
+- Only one pending system-sound action may exist at a time.
+- If the user attempts to request another while one is pending, show a message: "A system-sound change is already pending. Finish or cancel it first."
+- Persist the pending action in `SavedStateHandle` (or equivalent saved-state mechanism) before launching Settings.
+- Include `createdAtMs` so stale actions can be discarded on resume or process restore.
+- If `System.currentTimeMillis() - createdAtMs > PENDING_SYSTEM_SOUND_TTL_MS`, clear the pending action and show a timeout message.
+
+Flow:
 
 ```text
 User taps "Set as Ringtone"
         │
         ▼
-Source readable? ── no ─► Failure: file unavailable
+Source readable and not DRM-protected? ─ no ─► Failure: file unavailable
+        │ yes
+        ▼
+Confirmation sheet
+  "Set 'Song Name' as your default ringtone?"
+  "The whole track plays from the start. Some apps and per-contact
+   or per-SIM settings may not be affected."
+  (API 29+: "A copy will be saved to Ringtones.")
+        │ confirm
+        ▼
+Settings.System.canWrite() ? ─ no ─► 1. Save PendingSystemSound(trackId, type, createdAtMs)
+        │ yes                          2. Explain, then launch ACTION_MANAGE_WRITE_SETTINGS
+        │                              3. On RESUME: re-check canWrite()
+        │                                   granted → run the pending action once and clear it
+        │                                   not granted → clear it and show
+        │                                   "Permission needed to change system sounds."
+        ▼
+Processing: "SETTING RINGTONE..."  (duplicate taps ignored)
         │
-        └─ yes
-            │
-            ▼
-        Confirmation sheet
-        "Set 'Song Name' as your default ringtone?"
-        (API 29+: "A copy will be saved in Ringtones.")
-            │
-            ▼
-        canWrite() ? ── no ─► Explain + ACTION_MANAGE_WRITE_SETTINGS
-            │
-            └─ yes
-                │
-                ▼
-            Pending action stored
-            ▼
-            Processing: "SETTING RINGTONE..."
-            │
-            ▼
-            readBack check
-            │
-            ├─ success → success message
-            └─ failure → failure message and cleanup of partial copy
+        ▼
+copy (API 29+) or direct URI (API 26-28) → setActualDefault...Uri
+        │
+        ▼
+Read back and compare (section 19)
 ```
 
-Critical rule:
-- the app must not lose the pending action when returning from Settings
-- ViewModel or use-case layer should save a one-shot pending action as a small ephemeral state object
-- on permission grant, re-run exactly once
-- if the user leaves Settings without granting, do not retry automatically
-- if permission is denied, show “Permission needed to change system sounds.”
+Important:
+- The pending action must be saved before leaving for Settings.
+- The app must not assume the Settings result is reliable.
+- `ACTION_MANAGE_WRITE_SETTINGS` may return without a reliable result code, so `canWrite()` is the only valid check on resume.
 
-## 21. Success Verification
+## 19. Strategy, Verification and Outcomes
 
-Never claim success unless the read-back confirms the change.
-- after setActualDefaultRingtoneUri / setActualDefaultNotificationUri / setActualDefaultAlarmUri
-- read back the default value from the system
-- compare to the URI that was actually written
-- if mismatch:
-  - treat as failure
-  - if a copy was created, delete the partial entry
-  - show failure message
+### Source strategy by API level
 
-### Messages
+| API level | Strategy |
+|---|---|
+| 29+ | Copy the track into the matching MediaStore audio collection (`RELATIVE_PATH` = `Ringtones/`, `Notifications/`, `Alarms/`), with `IS_RINGTONE` / `IS_NOTIFICATION` / `IS_ALARM` and `IS_PENDING` while writing. Set the copied entry as the default. |
+| 26-28 | Use the track's original MediaStore URI directly (no copy), because writing to shared storage would require a legacy permission the app is not requesting. |
+| lower than 26 | Not supported by the project baseline. |
+
+Copy-on-29+ policy:
+- Saves a copy in the OS-managed ringtone collection.
+- Keeps the setting working if the original file moves or is deleted.
+- Matches Android's standard behavior for ringtone collections.
+
+### Verification: intended behavior and result states
+
+After setting the default, read it back with `RingtoneManager.getActualDefaultRingtoneUri(type)`.
+
+Algorithm:
+1. Resolve both the intended URI and the read-back URI to a MediaStore id.
+2. Compare IDs.
+3. If they match: `Success`
+4. If they do not match: `Failed`
+5. If read-back is null, cannot be resolved, or the MediaStore entry is temporarily unavailable: `Unverified`
+
+Do not delete the copy for `Unverified`; the change might have succeeded but the system did not surface a resolvable value. Show the soft message below.
+
 | Outcome | Message |
 |---|---|
-| ringtone success | “Default ringtone updated.” |
-| notification success | “Default notification sound updated.” |
-| alarm success | “Default alarm sound updated.” |
-| permission not granted | “Permission needed to change system sounds.” |
-| source missing/unreadable | “This track’s file could not be accessed.” |
-| system rejected change | “Could not set this track as the ringtone.” (type adjusted per action) |
-| unsupported on device | “This device does not support changing this sound.” |
-| notification channel caveat | “Some apps use their own channel sound and may not be affected.” |
+| Ringtone success | "Default ringtone updated." |
+| Notification success | "Default notification sound updated." |
+| Alarm success | "Default alarm sound updated." |
+| Unverified | "Your device accepted the request, but we could not confirm the change. Check your sound settings." |
+| Permission not granted | "Permission needed to change system sounds." |
+| Source missing, unreadable or DRM-protected | "This track's file could not be accessed." |
+| System rejected / setter failed | "Could not set this track as the ringtone." (type adjusted per action) |
+| Unsupported on this device | "This device doesn't support changing this sound." |
+| Notification channel caveat | "Some apps use their own channel sound and may not be affected." |
 
-## 22. Copy and Cleanup Behavior
+## 20. Copy Registry (Room)
 
-Copy rules:
-- copy runs on IO
-- shows loading state
-- blocks duplicate taps
-- if copy fails midway:
-  - remove partial file
-  - clear pending action
-- if the copied file exists and matches the source:
-  - reuse it
-- if the user wants to remove created copies:
-  - use the app-managed registry and delete only files created by the app
+The app records every system-sound copy it creates so it can avoid duplicates and clean up later. This is a Room table, not DataStore.
 
-Important:
-- The app must not delete files it did not create.
-- This is a privacy-preserving and predictable policy.
-
-## 23. Architecture
-
-```text
-UI
-  └─ ViewModel
-      └─ SetSystemSoundUseCase
-          └─ SystemSoundManager
-              ├─ canWrite()
-              ├─ prepareSource(track, type)
-              ├─ setDefault(type, uri)
-              ├─ readBack(type)
-              └─ created-copy registry
+```kotlin
+@Entity(
+    tableName = "system_sound_copies",
+    indices = [Index("sourceTrackId", "type")]
+)
+data class SystemSoundCopyEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val sourceTrackId: Long,
+    val type: String,              // RINGTONE | NOTIFICATION | ALARM
+    val copiedUri: String,
+    val copiedMediaId: Long,
+    val relativePath: String,      // Ringtones/ | Notifications/ | Alarms/
+    val displayName: String,
+    val sizeBytes: Long,
+    val createdAt: Long,
+)
 ```
 
 Rules:
-- no RingtoneManager or Settings calls from Composables or ViewModels
-- the domain layer exposes result types independent of Android classes
-- view-model emits effect to launch Settings if permission is missing
-- data layer performs copy and resolution
+- Add it to `DATA_MODEL.md` with a migration test.
+- Exclude it from Auto Backup and device transfer. The URIs and MediaStore ids are device-specific and not portable.
+- Reuse the existing copy if `(sourceTrackId, type)` already exists and the entry still exists in MediaStore.
+- Fallback match:
+  - same display name + same size + same collection path + same app owner,
+  - only when exactly one candidate matches
+- Cleanup safety:
+  - delete only entries created by the app
+  - skip the current default if it is still active
+  - tell the user if the system default is currently in use
+- On API 26-28, no copies are created, so no registry rows are written.
+
+## 21. Copy Execution
+
+- Copy runs on `Dispatchers.IO` with a loading state and duplicate-tap protection.
+- Write with `IS_PENDING = 1`; clear it only after the copy succeeds.
+- On any failure, delete the pending entry and clear the pending action.
+- Honor cancellation: leaving the screen does not leave partial files.
+- On timeout:
+  - show a timeout banner or message
+  - clear the pending action
+  - clean up partial copy if one was created
+
+## 22. Architecture
+
+```text
+UI (screen)
+   ▲ one-shot effect (launch Settings / show message)
+ViewModel ──► SetSystemSoundUseCase                  (domain)
+                      │
+                      ▼
+              SystemSoundManager                     (data/system)
+              ├─ canWrite(): Boolean
+              ├─ prepareSource(track, type): Result<Uri>   // copy (29+) or direct URI (26-28)
+              ├─ setDefault(type, uri): Result<Unit>
+              ├─ readBack(type): ReadBackResult             // Success | Failed | Unverified
+              └─ copy registry access (Room DAO)
+```
+
+Rules:
+- No `RingtoneManager`, `Settings` or system-setting `ContentResolver` calls inside Composables or ViewModels.
+- The domain result type is independent of Android classes: `Success`, `Unverified`, `NeedsPermission`, `SourceUnavailable`, `Unsupported`, `Failed(cause)`.
+- `NeedsPermission` makes the ViewModel save the pending action and emit an effect; the screen launches Settings.
 
 ---
 # Part E: Song Details
 
-## 24. Data Model
+## 23. Data Model and Sources
 
-MediaStore does not provide everything needed. Details are loaded on demand off the main thread through an inspector.
+MediaStore does not provide everything needed. Details load on demand off the main thread through a separate model. Do not add these fields to `Track` or to library scanning.
 
 ```kotlin
 data class TrackDetails(
-    val title: String?,
-    val artist: String?,
-    val album: String?,
-    val albumArtist: String?,
-    val genre: String?,
-    val year: Int?,
-    val trackNumber: Int?,
-    val discNumber: Int?,
+    val title: String?, val artist: String?, val album: String?,
+    val albumArtist: String?, val genre: String?,
+    val year: Int?, val trackNumber: Int?, val discNumber: Int?,
     val durationMs: Long?,
-    val mimeType: String?,
-    val formatLabel: String?,
-    val bitrateKbps: Int?,
-    val sampleRateHz: Int?,
-    val channelCount: Int?,
-    val fileName: String?,
-    val sizeBytes: Long?,
-    val relativePath: String?,
-    val dateAddedSec: Long?,
-    val dateModifiedSec: Long?
+    val mimeType: String?, val formatLabel: String?,
+    val bitrateKbps: Int?, val sampleRateHz: Int?, val channelCount: Int?,
+    val fileName: String?, val sizeBytes: Long?, val relativePath: String?,
+    val dateAddedSec: Long?, val dateModifiedSec: Long?,
 )
 ```
 
 | Field | Source |
 |---|---|
-| title, artist, album, year, track number, duration, MIME, size, date added/modified, file name, relative path | MediaStore |
-| albumArtist, genre, disc number, bitrate | MediaStore columns when available, otherwise MediaMetadataRetriever |
-| sample rate, channel count | MediaExtractor / MediaFormat |
-| format label | derived from MIME / container |
+| Title, artist, album, year, track number, duration, MIME type, size, date added/modified, file name, relative path | MediaStore (available on all supported APIs; `relativePath` on API 29+, otherwise derived from `DATA`) |
+| Album artist, genre, disc number, bitrate | MediaStore columns only on API 30+; on API 26-29 use `MediaMetadataRetriever` |
+| Sample rate, channel count | `MediaExtractor` / `MediaFormat` (`KEY_SAMPLE_RATE`, `KEY_CHANNEL_COUNT`); not available from MediaStore on any API |
+| Format label | Derived from MIME type / container |
 
-`AudioFileInspector` (in data/media/) wraps MediaMetadataRetriever and MediaExtractor. It:
+`AudioFileInspector` (in `data/media/`) wraps `MediaMetadataRetriever` and `MediaExtractor`. It:
 - always releases resources
-- runs on Dispatchers.IO
-- uses timeouts
-- returns partial results when some fields are unreadable
+- runs on `Dispatchers.IO`
+- enforces `INSPECTOR_TIMEOUT_MS`
+- returns partial results when only some fields can be read
 - never crashes the app
 
-`GetTrackDetailsUseCase` merges MediaStore metadata with inspector output.
+`GetTrackDetailsUseCase` merges MediaStore data with the inspector result.
 
-## 25. Display Rules
+## 24. Display Rules
 
-- Show only values reliably obtained
-- omit or show “Unknown” as appropriate
-- never fabricate metadata
-- do not display the content URI
-- relative path may be shown if valid
-- include a “Copy path” action if needed
-- load with a short loading state
-- use existing menu actions: Share, Add to Playlist, Favorite, Set as Ringtone, Show in Files
+- Show only values reliably obtained; omit the row or show "Unknown" per the design system.
+- Never fabricate artist, album, year, bitrate, sample rate or size.
+- Do not show the content URI.
+- The relative path may be shown if valid and copyable.
+- Include a "Copy path" action.
+- Load with a short loading state.
+- If the inspector fails, MediaStore fields still display.
+- Use the existing menu actions: Share, Set as Ringtone, Add to Playlist, Favorite, Show in Files.
 
 Example:
-- SONG DETAILS
-- Title
-- Artist
-- Album
-- Duration
-- Format
-- Bitrate
-- Sample Rate
-- Channels
-- File Size
-- Location
-- Date Added
 
-## 26. Song Details Entry Points
+```text
+SONG DETAILS
 
-- context menu from any track row
-- overflow menu in Now Playing
-- details screen or sheet
-- selection mode “Details” if exactly one item selected
+JAAT GELO
+Band Lalon
+────────────────────
+ALBUM        Bi Protip
+DURATION     04:32
+FORMAT       MP3
+BITRATE      320 kbps
+SAMPLE RATE  44.1 kHz
+CHANNELS     2
+FILE SIZE    10.4 MB
+LOCATION     Music/Lalon/   [COPY]
+DATE ADDED   12 Oct 2026
+```
 
 ---
 # Part F: Show in Files (P2, Best Effort)
 
-## 27. Behavior
+## 25. Behavior
 
-Android has no standard “show this file in a file manager” guarantee. Therefore:
+Android has no standard "show this folder" guarantee, and results vary by file manager.
 
-- label action as “Show in Files”
-- build an ACTION_VIEW intent using a folder document URI derived from relative path
-- resolve the intent before launching
-- if no file manager can handle it:
-  - show: “No compatible file manager is available.”
-- reliable fallback:
-  - show the relative path in Song Details with Copy action
-- hide the action for:
-  - removable volumes
-  - invalid or unmappable paths
-  - unsupported APIs
-  - private app paths
-- never expose private paths in the UI
-- never crash on failure
-
-This is P2 and best effort.
+- Label the action "Show in Files".
+- Build an `ACTION_VIEW` intent with a folder document URI derived from `RELATIVE_PATH` for primary external storage only.
+- Use the directory MIME type `DocumentsContract.Document.MIME_TYPE_DIR`.
+- Resolve the intent before launching. If it cannot be resolved or fails: "No compatible file manager is available."
+- The dependable fallback is the copyable relative path in Song Details.
+- Hide the action for removable volumes, invalid or unmappable paths, unsupported APIs, and private app paths.
+- Never expose private paths in the UI.
+- Never crash.
 
 ---
 # Part G: Navigation, Multi-Select, Batch
 
-## 28. Entity Navigation
+## 26. Entity Navigation
 
-“Go to Artist / Album / Folder” navigates using the existing navigation graph.
+"Go to Artist / Album / Folder" navigates through the existing navigation graph.
 
 Rules:
-- if the target no longer exists after a refresh, show a short message
-- keep the user on the current screen
-- no duplicate screens or new graph branches
+- If the target no longer exists after a library refresh, show a short message and stay on the current screen.
+- No duplicate screens or new graph branches.
 
-## 29. Multi-Select
+## 27. Multi-Select
 
-Applies to:
-- Tracks
-- Search results
-- Playlist tracks
-- Folder tracks
+Applies to Tracks, Search results, Playlist tracks and Folder tracks. Long-press enters selection mode.
 
-Long-press enters selection mode.
+```text
+3 SELECTED        [Select All] [Clear]
+Share · Add to Queue · Add to Playlist · Favorite
+```
 
-Selection mode requirements:
-- selection state is temporary UI state only
-- selection is tracked by track id, not UI position
-- selection survives sort changes as long as track ids remain valid
-- if library refresh removes some items:
-  - drop missing ids
-  - update count
-  - exit selection if empty
-- back press exits selection first
-- selection mode shows a contextual top bar; normal navigation is disabled while selection is active
+Selection keys:
 
-## 30. Batch Actions
+| Screen | Selection is keyed by |
+|---|---|
+| Tracks, Search, Folder, Album | Track id |
+| Playlist detail | Playlist item id |
+
+Rules:
+- Selection is temporary UI state, never stored in Room or DataStore.
+- Keying by id means selection survives re-sorting.
+- When a library refresh removes tracks, drop the missing ids, update the count, and exit selection mode if empty.
+- Back press exits selection mode first.
+- Leaving the screen clears selection.
+- Selection mode shows a contextual top bar; normal navigation is disabled while it is active.
+
+## 28. Batch Actions
 
 | Action | Notes |
 |---|---|
-| Add to Queue | existing queue API, selection order preserved |
-| Add to Playlist | one picker for all selected |
-| Favorite toggle | if any selected item is not favorite, show Add; otherwise Remove |
-| Share | up to 100 URIs |
-| Remove from Playlist | direct playlist remove, not file delete |
+| Add to Queue | Existing queue API; order follows visible list order |
+| Add to Playlist | One picker for all selected |
+| Favorite toggle | If any selected item is not a favorite, show Add; otherwise Remove |
+| Share | Up to 100 URIs |
+| Remove from Playlist | Playlist screens only; uses playlist item ids; never deletes audio |
 
 Out of scope:
 - batch delete / move / rename
-- system-sound batch changes
+- batch system-sound changes
 
-## 31. Search Results and Playlist Integration
+## 29. Search, Playlist and Now Playing Integration
 
-- Search results expose the same menu and action framework
-- Playlist tracks expose same menu plus Remove from Playlist
-- sorting defaults to Relevance for search
-- playlist sort and folder sort remain separate from search sort
+- Search results expose the same menu through `availableActions`; defaults to Relevance.
+- Playlist tracks expose the same menu plus Remove from Playlist.
+- Now Playing gets a compact overflow menu: Add to Favorites, Add to Playlist, Share, Song Details, Set as Ringtone.
+- Main controls remain unchanged.
 
 ---
 # Part H: Cross-Cutting Requirements
 
-## 32. UI and Accessibility
+## 30. UI, Accessibility, Performance, Errors
 
-- follow DESIGN_SYSTEM.md and SCREEN_SPECIFICATIONS.md
-- black/white base with restrained red accent
-- strong contrast
-- clear labels
-- 48 dp touch targets minimum
-- explicit content descriptions for actions
-- selection mode announces “N selected”
-- respect reduced-motion settings
-- ensure no visual clutter
+### UI and accessibility
+- Follow `DESIGN_SYSTEM.md` and `SCREEN_SPECIFICATIONS.md`.
+- Use black/white base with a restrained red accent.
+- Strong contrast and clear labels.
+- 48 dp touch targets minimum.
+- Explicit `contentDescription` values.
+- Selection mode announces "N selected".
+- Respect reduced-motion settings.
+- No visual clutter.
 
-## 33. Performance
+### Performance
+- Large libraries must not slow down.
+- No repeated sorting or MediaStore queries on recomposition.
+- Sorted lists are cached per (library snapshot, sort state, locale).
+- Song Details extraction and copy operations run off the main thread.
 
-- large libraries must not slow down
-- no repeated sorting on recomposition
-- no repeated MediaStore queries on each render
-- sort results are cached by snapshot + sort state
-- details extraction is off-main-thread
-- copy operations are off-main-thread
+### Errors
+Every system integration returns a result type, with explicit success/failure behavior:
 
-## 34. Error Handling
+```text
+Idle → Processing → Success | Unverified | Failure(reason)
+```
 
-Every system integration must have explicit success/failure behavior with a result type:
-- Idle → Processing → Success
-- Idle → Processing → Failure(reason)
+Rules:
+- User-readable, non-crashing, actionable where possible.
+- No stack traces in the UI.
+- Long operations show a loading state.
+- Duplicate taps are ignored while processing.
+- Sanitized cause is logged.
 
-Failure handling rules:
-- user-readable, non-crashing, actionable when possible
-- no stack traces in the UI
-- long operations show a loading state
-- duplicate taps are ignored while processing
-- log sanitized failure cause
+## 31. Launching Intents from the UI Layer
 
-## 35. Launching Intents from the UI Layer
-
-ViewModels and use cases must not call Activity APIs. Sharesheet, ACTION_MANAGE_WRITE_SETTINGS, and file-manager intents require Activity context. Pattern:
+ViewModels and use cases must not call Activity APIs. Sharesheet, `ACTION_MANAGE_WRITE_SETTINGS`, and file-manager intents need an Activity context.
 
 ```kotlin
 sealed interface UtilityEffect {
     data class LaunchShare(val intent: Intent) : UtilityEffect
-    data class RequestWriteSettings(val pendingAction: TrackAction) : UtilityEffect
+    data class RequestWriteSettings(val pending: PendingSystemSound) : UtilityEffect
     data class OpenInFiles(val intent: Intent) : UtilityEffect
     data class ShowMessage(val message: UiText) : UtilityEffect
 }
 ```
 
 Rules:
-- effects are consumed exactly once
-- pending action is re-run after permission is granted
-- rotation must not replay effect unexpectedly
-- the screen collects effects and calls startActivity / launcher
+- Each effect is consumed exactly once.
+- Rotation must not replay it.
+- The pending system-sound action is in saved state, not in the effect itself.
+- The screen re-checks permission on resume and tells the ViewModel to run or clear the pending action.
 
-## 36. Repository, Room, DataStore, Logging
+## 32. Repository, Room, DataStore, Logging
 
-- MediaStore data flows through existing data source and repository
-- no new Room tables for sort preferences or temporary UI state
-- DataStore holds sort preferences
-- system-sound copy registry is stored in Room or DataStore, not ad hoc memory
-- log share failures, write-settings failures, unreadable-file failures, unsupported operations, and permission outcomes
-- do not log private paths or user audio contents
-- follow the project’s release logging policy
+- MediaStore data flows through the existing data source and repository.
+- System integrations flow `UI → ViewModel → Use Case → System abstraction → Android framework`.
+- Room:
+  - the only new table is `system_sound_copies`
+  - no Room tables for sort preferences, selection state, share state or temporary UI state
+- DataStore:
+  - holds the sort preferences
+- Logging:
+  - log share failures, write-settings failures, unreadable-file failures, unsupported operations, and permission outcomes
+  - do not log paths, audio contents, or private data
+  - follow project release logging policy
 
-## 37. Android Version Compatibility
+## 33. Android Version Compatibility
 
-- detect and handle unsupported operations
-- use supported APIs
-- avoid deprecated APIs when a replacement exists
-- handle version-specific differences:
-  - copy behavior on 29+ vs direct URI on 26-28
-  - MediaStore column availability on API 30+
-  - WRITE_SETTINGS behavior across Android versions
-  - file manager capability differences
-- never report success if Android rejected the operation
+- Detect unsupported operations.
+- Use supported APIs.
+- Avoid deprecated APIs when a replacement exists.
+- Never report success when Android rejected the operation.
+- Handle version-specific differences:
+  - copy behavior on API 29+ vs direct URI on API 26-28
+  - MediaStore columns only available on API 30+ for Song Details
+  - `WRITE_SETTINGS` flow and its lack of a result code
+  - file-manager capability differences
+  - ICU `Collator` numeric collation availability (API 24+)
 
 ---
 # Part I: Testing and Delivery
 
-## 38. Automated Tests
+## 34. Automated Tests
 
 | Area | Required Cases |
 |---|---|
-| Sorting | each key and direction per entity; locale-aware ordering with Bangla and accented titles; null/unknown last; tie-breaker; migration from sort_order; queue unaffected by sort change |
-| Action framework | availableActions for library, search, playlist, album/artist/folder, unavailable track; handler delegates correctly |
-| Share | URI/MIME resolution, invalid URI, missing file, multi-URI intent, 100-item cap, skipped-track count |
-| System sound | success, permission-needed, source missing, unsupported, read-back mismatch, copy reuse, partial copy cleanup, API-specific strategy |
-| Song Details | merge MediaStore + inspector, partial failure, no fabricated values, timeout |
-| Multi-select | selection survives sort change, ids removed on refresh, favorite toggle rule, selection exited on back |
-| Effects | effect consumed once; no re-fire on rotation; pending action resumes after permission |
-| Migration | sort_order migration is idempotent and deterministic |
+| Sorting | Each key and direction per entity; locale-aware ordering with Bangla and accented titles; numeric collation ("2" before "10"); locale-change invalidation; unknown last in both directions; stable tie-breaker; `sort_order` migration (idempotent); queue unaffected by sort change |
+| Action framework | `availableActions` for library, search, playlist, album/artist/folder screens, unavailable track, DRM/unreadable track; handler delegates correctly |
+| Share | URI and MIME fallback resolution; `ClipData` and grant flag always present; missing file; invalid URI; multi-URI intent; 100-item cap; skipped-track count |
+| System sound | Success; Unverified; Failed with partial-copy cleanup; permission-needed; source missing/DRM; unsupported; read-back compared by media id with differently formatted URIs; copy reuse; registry row create/update; API-specific strategy via fakes; cleanup skips the current default |
+| Pending action | Saved before Settings; restored after process death; runs exactly once after grant; cleared when not granted; permission decided by `canWrite()` on resume |
+| Song Details | Merge MediaStore + inspector; API 26-29 vs 30+ field sources; partial inspector failure; timeout; no fabricated values |
+| Multi-select | Selection survives re-sort; ids dropped on refresh; playlist selection by item id with duplicate tracks; favorite toggle rule; exit on back |
+| Effects | Consumed once; no re-fire on rotation |
+| Room | `system_sound_copies` DAO and migration test; `Auto Backup` exclusion configuration |
 
-## 39. Physical Device Tests
+Unit tests do not replace device testing for system APIs.
+
+## 35. Physical Device Tests
 
 Required physical tests:
-- sorting with non-Latin titles
-- share with at least two receiving apps
-- ringtone set and verify in system settings
-- notification sound change and verify in system settings
-- alarm sound change and verify in system settings
-- permission grant and deny flows
-- track unavailable and unreadable file handling
-- song details with missing tags
-- file manager support / Show in Files
-- multi-select on a list with >20 items
-- large batch share boundary (99, 100, 101)
-- external SD card / removable volume behavior
-- work profile / multi-user scenario if available
-- accessibility pass with TalkBack
+- Sorting with non-Latin titles
+- Share with at least two receiving apps
+- Ringtone set and verify in system settings
+- Notification sound change and verify in system settings
+- Alarm sound change and verify in system settings
+- Permission grant and deny flows
+- Track unavailable / unreadable / DRM-protected file handling
+- Song details with missing tags
+- File manager support / Show in Files
+- Multi-select on a list with >20 items
+- Large batch share boundary: 99, 100, 101
+- External SD card / removable volume behavior
+- Work profile / multi-user scenario if available
+- Accessibility pass with TalkBack
+- OEM customization pass on at least one non-stock/modified launcher or OEM skin if available
 
-## 40. Regression Testing
+## 36. Regression Testing
 
 All existing functionality must continue to pass:
 - library
@@ -837,9 +817,18 @@ All existing functionality must continue to pass:
 - background playback
 - Room persistence
 
-Any prior manual or automated verification gaps must be explicitly recorded as NOT VERIFIED until actually run.
+Any prior manual or automated verification gaps must be listed as `NOT VERIFIED` in the QA report until actually run.
 
-## 41. Build Verification
+Previously unverified items:
+- Headphone unplug and Bluetooth disconnect behavior
+- Phone-call audio-focus interruption
+- Reboot and headset-button playback resumption
+- Lock-screen controls
+- 10,000-track queue test
+- TalkBack accessibility pass
+- Work-profile / multi-user behavior
+
+## 37. Build Verification
 
 ```bash
 ./gradlew testDebugUnitTest --rerun-tasks
@@ -850,7 +839,7 @@ Any prior manual or automated verification gaps must be explicitly recorded as N
 
 No new fatal lint errors.
 
-## 42. Definition of Done (per feature)
+## 38. Definition of Done (per feature)
 
 A feature is done only when:
 - architecture still matches the project structure
@@ -861,27 +850,32 @@ A feature is done only when:
 - no unnecessary permissions are added
 - offline behavior is preserved
 - failure states are handled
-- AGENT_STATE.md and CHANGELOG.md are updated
+- `AGENT_STATE.md`, `CHANGELOG.md`, `PRODUCT_SPEC.md`, `DATA_MODEL.md` and the privacy/About text are updated
 
-## 43. Completion Matrix
+## 39. Completion Matrix
 
 | Feature | Priority | Automated | Physical |
 |---|---|---|---|
 | Track sorting | P0 | Required | Required |
-| Track action framework | P0 | Required | Required |
+| Track action framework and menu | P0 | Required | Required |
 | Share audio | P0 | Required | Required |
 | Song Details | P0 | Required | Required |
 | Set as ringtone | P0 | Required | Required |
-| Set as notification sound | P1 | Required | Required |
-| Set as alarm sound | P1 | Required | Required |
+| Notification sound | P1 | Required | Required |
+| Alarm sound | P1 | Required | Required |
 | Multi-select | P1 | Required | Required |
 | Batch actions | P1 | Required | Required |
 | Entity navigation | P1 | Required | Required |
 | Show in Files | P2 | Required | Best effort |
 
-## 44. Milestones
+## 40. Milestones
 
-All P0 features ship before P1. Compile, run relevant tests, inspect changes, and update AGENT_STATE.md and CHANGELOG.md after each milestone.
+All P0 features ship before P1. After each milestone:
+- compile
+- run relevant tests
+- inspect changes
+- update `AGENT_STATE.md` and `CHANGELOG.md`
+- do not combine milestones into one uncontrolled change
 
 ```text
 M16  Library Sorting
@@ -896,118 +890,104 @@ M24  Automated + Physical Regression QA
 M25  Release Candidate 2
 ```
 
-## 45. State Accuracy Rule
+## 41. State Accuracy and Release Protection
 
-Never claim “Complete”, “Verified”, “Passed”, or “Release Ready” unless validation actually happened. If physical verification was not performed:
-- write: Physical Verification: NOT VERIFIED
-- do not infer success from unit tests
-
----
-
-## 46. Release Protection
-
-Do not begin release signing while these features are still changing. After M24 passes, create RELEASE CANDIDATE 2 and then resume release engineering.
+- Never claim "Complete", "Verified", "Passed" or "Release Ready" unless validation actually happened.
+- If physical verification was not performed, write `Physical Verification: NOT VERIFIED`.
+- Do not infer device success from unit tests.
+- Do not begin release signing while these features are changing.
+- After M24 passes, create `RELEASE CANDIDATE 2`; only then resume release engineering.
 
 ---
 
-## 47. Explicit Non-Goals
+## 42. Explicit Non-Goals
 
-Streaming, online catalogs, cloud sync, accounts, lyrics scraping, AI recommendations, audio editing, tag editing, album-art editing, batch copy/delete/move/rename file operations, social features, music recognition, automatic online metadata refresh.
+Streaming, online catalogs, YouTube integration, cloud sync, accounts, lyrics scraping, AI recommendations, audio editing or trimming, equalizer/DSP, tag editing, album-art editing, batch file delete/move/copy/rename, social features, music recognition, online metadata refresh.
 
 ---
 
-## 48. Implementation Rules for the Coding Agent
+## 43. Implementation Rules for the Coding Agent
 
 Before changing code, read:
-- AGENT_STATE.md
-- PRODUCT_SPEC.md
-- ARCHITECTURE.md
-- DESIGN_SYSTEM.md
-- SCREEN_SPECIFICATIONS.md
-- INTERACTION_SPEC.md
-- DATA_MODEL.md
-- PLAYBACK_ARCHITECTURE.md
-- TEST_PLAN.md
+- `AGENT_STATE.md`
+- `PRODUCT_SPEC.md`
+- `ARCHITECTURE.md`
+- `DESIGN_SYSTEM.md`
+- `SCREEN_SPECIFICATIONS.md`
+- `INTERACTION_SPEC.md`
+- `DATA_MODEL.md`
+- `PLAYBACK_ARCHITECTURE.md`
+- `TEST_PLAN.md`
 - this document
 
 Then audit the current implementation.
 
-Do not assume a feature is missing simply because it is listed here. If part of a feature already exists, extend or reuse it.
+Do not assume a feature is missing because it is listed here. If part of a feature already exists, extend or reuse it instead of duplicating it.
 
 ---
 
-## 49. Final Product Goal
+## 44. Final Product Goal
 
-Discover → Sort → Search → Play → Queue → Favorite → Playlist → Share → Set System Sound → Inspect Details → Manage Library
+```text
+DISCOVER → SORT → SEARCH → PLAY → QUEUE → FAVORITE → PLAYLIST
+        → SHARE → SET SYSTEM SOUND → INSPECT DETAILS → MANAGE LIBRARY
+```
 
-The app stays:
-- fast
-- local
-- private
-- mechanical
-- focused on the music itself
-
-No feature may compromise playback reliability or the offline-first philosophy.
+The app stays fast, local, private, mechanical and focused. No feature may compromise playback reliability or the offline-first philosophy.
 
 ---
 
-## 50. Open Decisions (owner sign-off required)
+## 45. Open Decisions (owner sign-off required)
 
 1. API 26-28 sound strategy:
-   - this spec uses the original URI directly on 26-28
-   - confirm or revise if you want a legacy write-permission path instead
-2. copy cleanup:
-   - whether to ship a “Remove created system sound copies” action in Settings
-3. share cap:
-   - 100 is default; adjust after actual binder-limit verification
+   - This spec uses the original URI directly on 26-28.
+   - Confirm or revise if you want a legacy write-permission path instead.
+2. Copy cleanup UI:
+   - Whether to ship a "Remove created system sound copies" action in Settings in v1 or defer it.
+3. Share cap:
+   - 100 by default; adjust after actual binder-limit verification.
 4. Show in Files:
-   - keep as P2 best effort or drop if device testing is poor
+   - Keep as P2 best effort or drop it if device testing shows poor file-manager support.
 5. Song Details UI:
-   - sheet vs screen; choose and keep consistent with SCREEN_SPECIFICATIONS.md
+   - Sheet or screen; choose one and keep it consistent with `SCREEN_SPECIFICATIONS.md`.
+6. Numeric collation:
+   - Confirm if numeric ordering is wanted in every title sort.
+7. Pending cleanup UI:
+   - Whether to show a "Cancel pending sound change" action in Settings flow.
 
 ---
 
-## 51. Change List from v1
+## 46. Document Updates Required When Adopting This Spec
 
+| Document | Update |
+|---|---|
+| `PRODUCT_SPEC.md` | Add `WRITE_SETTINGS` to the permission table; add the new feature requirements |
+| `DATA_MODEL.md` | Add `system_sound_copies`; add backup-exclusion note; add the new DataStore sort keys; mark `sort_order` as migrated |
+| `PLAYBACK_ARCHITECTURE.md` | No change expected; note that queue order is unaffected by sort |
+| `TEST_PLAN.md` | Add the cases from sections 34-36 |
+| Privacy / About screen | Explain why "Modify system settings" is requested and when |
+| `CHANGELOG.md` / `AGENT_STATE.md` | Record each milestone as it completes |
+
+---
+
+## 47. Change List
+
+### v4 → v5
 | Area | Change |
 |---|---|
-| Permissions | adds WRITE_SETTINGS and explicit permission flow |
-| System sounds | merges ringtone/notification/alarm into one mechanism |
-| API behavior | defines copy behavior for 29+ vs direct URI for 26-28 |
-| Copy tracking | adds registry of created copies for reuse and cleanup |
-| Result handling | adds pending-action pattern after Settings return |
-| Song Details | adds AudioFileInspector and TrackDetails model |
-| Show in Files | downgraded to P2 best effort |
-| Intents | adds ViewModel-effect pattern; ClipData + grant flag |
-| Sorting | adds locale-aware collation, unknown-last, tie-breaker, migration, queue independence |
-| Action framework | single TrackAction sealed type with shared handler |
-| Multi-select | selection by id, refresh-safe behavior, selection exit rules |
-| Milestones | P0 before P1; Song Details precedes ringtone work |
-| Process | introduces stricter NOT VERIFIED rules and physical-device QA requirements |
+| Pending action | Added TTL and single-pending-action rule |
+| Settings return | Requires `SavedStateHandle` persistence before leaving Settings and re-check of `canWrite()` on resume |
+| Read-back | Clarified algorithm using MediaStore id resolution; `Unverified` outcome added and full semantics defined |
+| Timeouts | Added `COPY_TIMEOUT_MS`, `INSPECTOR_TIMEOUT_MS`, `SHARE_MAX_ITEMS`, `PENDING_SYSTEM_SOUND_TTL_MS` |
+| Backup policy | States that `system_sound_copies` is excluded from Auto Backup and transfers |
+| Work profile / multi-user | Added physical QA requirement |
+| OEM caveat | Added test requirement for OEM-customized devices |
+| DRM | Added read-only / DRM / unreadable file handling to the share and Set as... logic |
+| Copy registry | Clarified reuse and cleanup rules, plus safe deletion policy |
+| Share | Clarified mandatory `ClipData` and read-grant flags |
+| QA / release | Added specific unverified items and stricter language around not reporting success without verification |
 
----
-
-## 52. Implementation Checklist
-
-Before starting development of any item in this spec, confirm:
-- [ ] the feature fits the protected baseline
-- [ ] the feature uses the existing playback architecture
-- [ ] DataStore/Room boundaries are respected
-- [ ] permission requirements are documented
-- [ ] failure states are handled
-- [ ] device verification plan is recorded
-- [ ] AGENT_STATE.md and CHANGELOG.md will be updated after implementation
-
----
-
-## 53. Final Rule
-
-Do not claim utility support is complete unless:
-- the feature was implemented and built
-- the relevant tests were run
-- the relevant physical-device verification was performed
-- the app still meets the protected baseline requirements
-
-If any verification is missing, record it honestly as NOT VERIFIED. The app must remain fast, offline, private, and listening-first.
+### v1 → v5
+`WRITE_SETTINGS` added; ringtone/notification/alarm merged into a single mechanism; copy vs direct URI strategy by API; `AudioFileInspector` and `TrackDetails`; Show in Files downgraded to P2; ViewModel-effect pattern for intents; per-entity sort keys, unknown-last rule, tie-breaker and queue independence; single `TrackAction` framework; milestones reordered with P0 first; pending action TTL and re-check rules added; backup exclusion and device-specific caveats added.
 
 End of document.
